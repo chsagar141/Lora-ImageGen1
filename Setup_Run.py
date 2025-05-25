@@ -1,56 +1,51 @@
 import os
 import cv2
-import face_recognition # Assumed to be installed by setup_run.py
+import face_recognition
+import logging
+import numpy as np
+import subprocess
 
-# Create folders if they don't exist
-os.makedirs('auto-crop-face\\output', exist_ok=True)
-os.makedirs('auto-crop-face\\failed', exist_ok=True)
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Cross-platform folder paths
+base_dir = 'auto-crop-face'
+load_folder = os.path.join(base_dir, 'load')
+output_folder = os.path.join(base_dir, 'output')
+failed_folder = os.path.join(base_dir, 'failed')
+
+# Ensure folders exist
+os.makedirs(load_folder, exist_ok=True)
+os.makedirs(output_folder, exist_ok=True)
+os.makedirs(failed_folder, exist_ok=True)
 
 def detect_faces(image_path):
-    """
-    Detects face locations in an image using the face_recognition library.
-
-    Args:
-        image_path (str): The path to the input image.
-
-    Returns:
-        list: A list of face locations (top, right, bottom, left) tuples.
-    """
     try:
         image = face_recognition.load_image_file(image_path)
         face_locations = face_recognition.face_locations(image)
         return face_locations
     except Exception as e:
-        print(f"Error detecting faces in {image_path}: {e}")
+        logging.error(f"Error detecting faces in {image_path}: {e}")
         return []
 
 def draw_rectangles_and_save(image_path, face_locations, output_path):
-    """
-    Crops an image based on face locations (or center if no faces)
-    and saves it to a specified output path with 512x512 dimensions.
-
-    Args:
-        image_path (str): The path to the input image.
-        face_locations (list): A list of face locations from detect_faces.
-        output_path (str): The path where the processed image will be saved.
-    """
     image = cv2.imread(image_path)
     if image is None:
-        print(f"Error: Could not read image {image_path}. Skipping.")
-        return
+        logging.warning(f"Could not read image {image_path}. Skipping.")
+        return False
 
     height, width = image.shape[:2]
+    if height < 100 or width < 100:
+        logging.warning(f"Image {image_path} is too small ({width}x{height}). Skipping.")
+        return False
+
     orig_area = height * width
     cropped = None
 
     if face_locations:
-        # Use the first detected face for cropping
         top, right, bottom, left = face_locations[0]
-
         face_width = right - left
         face_height = bottom - top
-
-        # Add a margin around the face
         margin_x = int(face_width * 0.5)
         margin_y = int(face_height * 0.5)
 
@@ -62,36 +57,29 @@ def draw_rectangles_and_save(image_path, face_locations, output_path):
         crop_width = new_right - new_left
         crop_height = new_bottom - new_top
         crop_area = crop_width * crop_height
-
-        min_area = orig_area * 0.5 # Ensure cropped area is at least 50% of original
+        min_area = orig_area * 0.5
 
         if crop_area < min_area:
             target_area = min_area
             target_side = int(target_area ** 0.5)
-
             center_x = new_left + crop_width // 2
             center_y = new_top + crop_height // 2
-
             half_side = target_side // 2
+
             new_left = max(0, center_x - half_side)
             new_top = max(0, center_y - half_side)
             new_right = min(width, center_x + half_side)
             new_bottom = min(height, center_y + half_side)
 
-            # Adjust if cropping goes out of bounds to maintain target_side
             if new_right - new_left < target_side:
                 new_left = max(0, new_right - target_side)
             if new_bottom - new_top < target_side:
                 new_top = max(0, new_bottom - target_side)
 
         cropped = image[new_top:new_bottom, new_left:new_right]
-
     else:
-        # If no faces detected, crop the central 50% of the image
         min_area = orig_area * 0.5
-        target_side = int(min_area ** 0.5)
-        target_side = min(target_side, height, width) # Ensure target_side doesn't exceed image dimensions
-
+        target_side = int(min(min_area ** 0.5, height, width))
         center_y, center_x = height // 2, width // 2
         new_top = max(0, center_y - target_side // 2)
         new_left = max(0, center_x - target_side // 2)
@@ -100,50 +88,62 @@ def draw_rectangles_and_save(image_path, face_locations, output_path):
 
         cropped = image[new_top:new_bottom, new_left:new_right]
 
-    # Resize the cropped image to 512x512 and save
     if cropped is not None and cropped.shape[0] > 0 and cropped.shape[1] > 0:
+        # Pad if too small before resizing
+        h, w = cropped.shape[:2]
+        if h < 512 or w < 512:
+            pad_y = max(0, (512 - h) // 2)
+            pad_x = max(0, (512 - w) // 2)
+            cropped = cv2.copyMakeBorder(cropped, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REFLECT)
+
         output_image = cv2.resize(cropped, (512, 512))
         cv2.imwrite(output_path, output_image)
+        return True
     else:
-        print(f"Warning: Cropped image for {image_path} is empty or invalid. Not saving.")
+        logging.warning(f"Cropped image for {image_path} is empty or invalid.")
+        return False
 
+def run_yolo_if_needed():
+    failed_images = [f for f in os.listdir(failed_folder)
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    if failed_images:
+        logging.info(f"⚠️ {len(failed_images)} image(s) in 'failed' folder. Running yolo.py...")
+        try:
+            subprocess.run(["python", "auto-crop-face\yolo.py"], check=True)
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error running yolo.py: {e}")
 
 def main():
-    """
-    Main function to process images in the 'load' folder, detect faces,
-    crop/resize, and save to 'output' or 'failed' folders.
-    """
-    load_folder = 'auto-crop-face\\load'
-    output_folder = 'auto-crop-face\\output'
-    failed_folder = 'auto-crop-face\\failed'
-
-    # Ensure load folder exists, though it's expected to be populated by user
-    os.makedirs(load_folder, exist_ok=True)
-
-    print(f"\n--- Starting Face Detection and Cropping (run.py) ---")
-    print(f"Looking for images in: {load_folder}")
+    logging.info("--- Starting Face Detection and Cropping (run.py) ---")
+    logging.info(f"Looking for images in: {load_folder}")
 
     images_found = False
     for filename in os.listdir(load_folder):
         if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
             images_found = True
             image_path = os.path.join(load_folder, filename)
-            print(f"Processing: {filename}")
+            logging.info(f"Processing: {filename}")
 
             face_locations = detect_faces(image_path)
 
             if face_locations:
+                logging.info(f"  ✅ Faces detected ({len(face_locations)} face(s))")
                 output_path = os.path.join(output_folder, filename)
-                print(f"  ✅ Faces detected in {filename} ({len(face_locations)} face(s))")
             else:
+                logging.info(f"  ❌ No faces detected")
                 output_path = os.path.join(failed_folder, filename)
-                print(f"  ❌ No faces detected in {filename}")
 
-            draw_rectangles_and_save(image_path, face_locations, output_path)
+            success = draw_rectangles_and_save(image_path, face_locations, output_path)
+            if not success:
+                logging.warning(f"  ⚠️ Failed to save: {filename}")
 
     if not images_found:
-        print(f"No image files found in '{load_folder}'. Please place images there to process.")
-    print("--- Face Detection and Cropping (run.py) Complete ---")
+        logging.info(f"No image files found in '{load_folder}'. Please place images there to process.")
+
+    # Trigger YOLO fallback if needed
+    run_yolo_if_needed()
+
+    logging.info("--- Face Detection and Cropping Complete ---")
 
 if __name__ == "__main__":
     main()
